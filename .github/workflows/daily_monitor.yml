@@ -26,6 +26,15 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements_monitor.txt
 
+      - name: Verify secrets are set
+        env:
+          GMAIL_USER:         ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+        run: |
+          if [ -z "$GMAIL_USER" ];         then echo "ERROR: GMAIL_USER secret is missing or empty";         exit 1; fi
+          if [ -z "$GMAIL_APP_PASSWORD" ]; then echo "ERROR: GMAIL_APP_PASSWORD secret is missing or empty"; exit 1; fi
+          echo "OK: both secrets present (user=${GMAIL_USER:0:4}...)"
+
       - name: Run monitor and send email
         env:
           GMAIL_USER:         ${{ secrets.GMAIL_USER }}
