@@ -45,7 +45,7 @@ SKIP       = 0
 REBAL_DAYS = 5
 OS_START   = "2026-05-01"
 DATA_START = "2021-06-01"   # far enough back for IS history + 252d warmup
-RECIPIENTS = ["rogerwugang@gmail.com", "feilu.fang@gmail.com"]
+RECIPIENTS = ["feilu.fang@gmail.com"]
 
 
 # ── Data loading ───────────────────────────────────────────────────────────────
