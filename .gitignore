@@ -1,0 +1,16 @@
+# Large local data files — never commit
+data/
+*.parquet
+
+# Backtest outputs (regenerated on demand)
+results_momentum/
+results_corr/*.png
+
+# Python
+__pycache__/
+*.pyc
+.env
+
+# OS
+.DS_Store
+Thumbs.db
