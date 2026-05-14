@@ -45,7 +45,7 @@ SKIP       = 0
 REBAL_DAYS = 5
 OS_START   = "2026-05-01"
 DATA_START = "2021-06-01"   # far enough back for IS history + 252d warmup
-RECIPIENT  = "rogerwugang@gmail.com"
+RECIPIENTS = ["rogerwugang@gmail.com", "feilu.fang@gmail.com"]
 
 
 # ── Data loading ───────────────────────────────────────────────────────────────
@@ -335,7 +335,7 @@ def make_html(
 
 # ── Email ──────────────────────────────────────────────────────────────────────
 
-def send_email(to: str, subject: str, html: str, chart_png: bytes) -> None:
+def send_email(to: list[str], subject: str, html: str, chart_png: bytes) -> None:
     gmail_user = os.environ.get("GMAIL_USER")
     gmail_pass = os.environ.get("GMAIL_APP_PASSWORD")
     if not gmail_user or not gmail_pass:
@@ -348,7 +348,7 @@ def send_email(to: str, subject: str, html: str, chart_png: bytes) -> None:
     msg            = MIMEMultipart("related")
     msg["Subject"] = subject
     msg["From"]    = gmail_user
-    msg["To"]      = to
+    msg["To"]      = ", ".join(to)
 
     alt = MIMEMultipart("alternative")
     msg.attach(alt)
@@ -362,7 +362,7 @@ def send_email(to: str, subject: str, html: str, chart_png: bytes) -> None:
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
         smtp.login(gmail_user, gmail_pass)
         smtp.sendmail(gmail_user, to, msg.as_string())
-    print(f"  Sent -> {to}")
+    print(f"  Sent -> {', '.join(to)}")
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
@@ -372,7 +372,7 @@ def main() -> None:
         description="Daily momentum monitor (GitHub Actions edition)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--to",       default=RECIPIENT)
+    parser.add_argument("--to", nargs="+", default=RECIPIENTS)
     parser.add_argument("--os-start", default=OS_START)
     parser.add_argument("--preview",  action="store_true",
                         help="Save HTML + chart locally; do not send email")
@@ -427,7 +427,7 @@ def main() -> None:
         print(f"  Preview -> {html_path}")
         print(f"  Chart   -> {chart_path}")
     else:
-        print(f"Sending email to {args.to} ...")
+        print(f"Sending email to {', '.join(args.to)} ...")
         send_email(args.to, subject, html, chart_png)
 
     print("Done.")
