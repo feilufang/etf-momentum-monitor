@@ -66,14 +66,26 @@ def load_prices_yf(tickers: list[str]) -> pd.DataFrame:
         start=DATA_START,
         auto_adjust=True,
         progress=False,
-        threads=True,
     )
+    print(f"  Raw shape: {raw.shape}  columns type: {type(raw.columns).__name__}")
 
-    # yfinance returns MultiIndex columns when >1 ticker
+    # yfinance column layout varies by version:
+    #   MultiIndex (field, ticker)  — most common for multi-ticker downloads
+    #   flat "Close" column         — single ticker or older versions
     if isinstance(raw.columns, pd.MultiIndex):
-        close = raw["Close"]
+        lvl0 = raw.columns.get_level_values(0).unique().tolist()
+        lvl1 = raw.columns.get_level_values(1).unique().tolist()
+        print(f"  MultiIndex level-0 samples: {lvl0[:5]}")
+        # (field, ticker) layout
+        if "Close" in lvl0:
+            close = raw["Close"].copy()
+        # (ticker, field) layout — seen in some yfinance builds
+        elif "Close" in lvl1:
+            close = raw.xs("Close", axis=1, level=1).copy()
+        else:
+            raise RuntimeError(f"Cannot find 'Close' in MultiIndex columns: {raw.columns[:10].tolist()}")
     else:
-        close = raw[["Close"]]
+        close = raw[["Close"]].copy()
         close.columns = tickers[:1]
 
     # Normalise index to YYYY-MM-DD strings to match the rest of the codebase
