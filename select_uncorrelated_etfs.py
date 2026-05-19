@@ -57,9 +57,27 @@ REF_FILE   = DATA_DIR / "reference/etf_tickers.parquet"
 
 # Matches leveraged and inverse ETFs by name
 _LEV_RE = re.compile(
-    r"\b[23][xX]\b|UltraPro|ProShares Ultra|Direxion Dail|Daily Target",
+    r"\b[23][xX]\b|UltraPro|ProShares Ultra|ProShares Short|Direxion Dail|Daily Target"
+    r"|Inverse |Short ETF|\bBear\b",
     re.IGNORECASE,
 )
+
+# Hard-coded exclusions: vol futures products and leveraged/inverse ETFs that
+# slip through the name regex (futures ETNs, "UltraShort", inverse single-stock)
+EXCLUDE_TICKERS = {
+    # VIX / volatility futures products
+    "VXX", "UVXY", "SVXY", "VIXY", "VIXM", "SVIX", "UVIX", "VIXI",
+    # Leveraged/inverse that evade the name regex
+    "TBT",   # ProShares UltraShort 20yr Treasury (2x inverse)
+    "BITI",  # ProShares Short Bitcoin ETF
+    "NVDS",  # Tradr 1.5x Short NVDA Daily ETF
+    "SH",    # ProShares Short S&P 500 (1x inverse equity)
+    "PSQ",   # ProShares Short QQQ
+    "DOG",   # ProShares Short Dow30
+    "RWM",   # ProShares Short Russell 2000
+    "SARK",  # AXS Short Innovation ETF (inverse ARKK)
+    "HDGE",  # AdvisorShares Ranger Equity Bear ETF
+}
 
 
 # ── Data loading ──────────────────────────────────────────────────────────────
@@ -86,6 +104,14 @@ def load_returns(
         etf_tickers -= lev
         print(f"  {len(lev):,} leveraged/inverse ETFs identified, "
               f"{before - len(etf_tickers):,} removed from universe")
+
+    # Hard-coded exclusions (vol futures ETNs and inverses that evade the name regex)
+    before = len(etf_tickers)
+    etf_tickers -= EXCLUDE_TICKERS
+    removed = before - len(etf_tickers)
+    if removed:
+        print(f"  {removed} hard-coded exclusions removed: "
+              f"{sorted(EXCLUDE_TICKERS & set(univ['ticker'].unique()))}")
 
     print("Loading daily bars ...")
     daily = pd.read_parquet(

@@ -27,11 +27,13 @@ Usage
 
 import argparse
 import sys
+from collections import deque
 from itertools import product
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from scipy.optimize import minimize
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -76,75 +78,174 @@ def load_prices(tickers: set[str]) -> pd.DataFrame:
 
 # ── Backtest engine ────────────────────────────────────────────────────────────
 
+def _erc_weights(cov: np.ndarray) -> np.ndarray:
+    """
+    Equal Risk Contribution weights via SLSQP.
+    Each asset contributes equally to total portfolio variance.
+    Falls back to equal weight if optimisation fails.
+    """
+    n = cov.shape[0]
+    if n == 1:
+        return np.array([1.0])
+
+    w0 = np.ones(n) / n
+
+    def obj(w):
+        var = float(w @ cov @ w)
+        if var <= 1e-12:
+            return 1e10
+        rc = w * (cov @ w) / var   # risk contributions, sum to 1
+        return float(np.sum((rc - 1.0 / n) ** 2))
+
+    res = minimize(
+        obj, w0, method="SLSQP",
+        bounds=[(1e-4, 1.0)] * n,
+        constraints={"type": "eq", "fun": lambda w: w.sum() - 1.0},
+        options={"ftol": 1e-10, "maxiter": 500},
+    )
+    w = np.maximum(res.x if res.success else w0, 0)
+    return w / w.sum()
+
+
+def _compute_target(
+    px: pd.DataFrame,
+    i: int,
+    tickers: list[str],
+    lookback: int,
+    skip: int,
+    use_erc: bool = False,
+    cov_lookback: int = 63,
+) -> pd.Series:
+    """Compute a single long/short target position vector at bar i."""
+    signal_px = px.iloc[i - 1 - skip][tickers]
+    past_px   = px.iloc[i - 1 - skip - lookback][tickers]
+    signal    = (signal_px - past_px) / past_px
+
+    valid = signal.dropna()
+    target = pd.Series(0.0, index=tickers)
+    if len(valid) < 4:
+        return target
+
+    ranked  = valid.rank(ascending=False)
+    n_valid = len(valid)
+    q       = max(1, n_valid // 4)
+    longs   = valid[ranked <= q].index.tolist()
+    shorts  = valid[ranked > n_valid - q].index.tolist()
+
+    if use_erc:
+        # Estimate covariance from the last cov_lookback days (no lookahead:
+        # uses returns up to and including close[i-1])
+        start = max(0, i - cov_lookback)
+        ret_hist = px.iloc[start:i].pct_change(fill_method=None).dropna()
+
+        def _book_weights(names: list[str]) -> np.ndarray:
+            avail = [t for t in names if t in ret_hist.columns]
+            if len(avail) < 2:
+                return np.ones(len(names)) / len(names)
+            r = ret_hist[avail].dropna(axis=1)
+            if r.shape[0] < 5 or r.shape[1] < 2:
+                return np.ones(len(names)) / len(names)
+            cov = r.cov().values
+            # Small diagonal regularisation for numerical stability
+            cov += np.eye(len(r.columns)) * cov.trace() / len(r.columns) * 0.01
+            return _erc_weights(cov)
+
+        if longs:
+            w = _book_weights(longs)
+            target[longs] = w
+        if shorts:
+            w = _book_weights(shorts)
+            target[shorts] = -w
+    else:
+        if longs:
+            target[longs]  =  1.0 / len(longs)
+        if shorts:
+            target[shorts] = -1.0 / len(shorts)
+
+    return target
+
+
+def _first_trading_days_of_month(dates: list) -> set:
+    """Return the set of dates that are the first trading day of their calendar month."""
+    dt = pd.to_datetime(dates)
+    first_days = set()
+    prev_month = None
+    for d in dt:
+        m = (d.year, d.month)
+        if m != prev_month:
+            first_days.add(d.normalize())
+            prev_month = m
+    return first_days
+
+
 def run_backtest(
     close: pd.DataFrame,
     tickers: list[str],
     lookback: int,
     rebal_days: int,
     skip: int = 0,
+    slice_days: int = 1,
+    monthly: bool = False,
+    use_erc: bool = False,
+    cov_lookback: int = 63,
 ) -> pd.Series:
     """
     Returns a daily P&L series (dollar P&L on $1 long + $1 short gross).
 
-    skip: trading days to exclude from the recent end of the lookback window.
-          Signal = (close[i-1-skip] - close[i-1-skip-lookback]) / close[i-1-skip-lookback]
-          skip=0 is the standard signal; skip=5 implements "12-1 week" momentum.
+    skip:       trading days to skip at the recent end of the lookback window.
+    slice_days: blend last N target portfolios to spread execution over N days.
+    monthly:    if True, ignore rebal_days and instead rebalance on the first
+                trading day of each calendar month, using the prior month-end
+                close as the signal. Overrides rebal_days.
     """
     px = close[tickers].dropna(how="all")
 
-    # Need enough history before first signal
     dates = px.index.tolist()
-    if len(dates) < lookback + skip + rebal_days + 1:
+    if len(dates) < lookback + skip + 2:
         return pd.Series(dtype=float)
 
-    n = len(tickers)
-    q_size = max(1, n // 4)     # quartile size
+    # Pre-compute rebal trigger dates
+    if monthly:
+        rebal_set = _first_trading_days_of_month(dates)
+    else:
+        rebal_set = None
 
-    daily_pnl = []
-    positions = pd.Series(0.0, index=tickers)   # current position (signed notional)
-
+    daily_pnl    = []
+    positions    = pd.Series(0.0, index=tickers)
+    target_queue = deque(maxlen=slice_days)
     rebal_counter = 0
+
     for i in range(lookback + skip + 1, len(dates)):
         today    = dates[i]
         px_today = px.loc[today, tickers]
         prev_px  = px.iloc[i - 1][tickers]
 
-        # 1. P&L first — old positions earn today's return (close[i-1] -> close[i])
-        #    These positions were entered at yesterday's close.
+        # 1. P&L: existing blended positions earn today's return
         day_ret = (px_today - prev_px) / prev_px
         day_pnl = (positions * day_ret).sum()
         daily_pnl.append((today, day_pnl))
 
-        # 2. End-of-day: update positions using a lagged signal.
-        #    Signal window ends skip days ago to avoid short-term reversal noise.
-        #    New positions enter at today's close (close[i]) — no look-ahead.
-        if rebal_counter == 0:
-            signal_px = px.iloc[i - 1 - skip][tickers]              # close[i-1-skip]
-            past_px   = px.iloc[i - 1 - skip - lookback][tickers]   # close[i-1-skip-LB]
-            signal    = (signal_px - past_px) / past_px
+        # 2. Determine whether to rebalance end-of-day
+        if monthly:
+            do_rebal = pd.Timestamp(today).normalize() in rebal_set
+        else:
+            do_rebal = (rebal_counter == 0)
 
-            valid = signal.dropna()
-            if len(valid) < 4:
-                positions = pd.Series(0.0, index=tickers)
-            else:
-                ranked  = valid.rank(ascending=False)
-                n_valid = len(valid)
-                q       = max(1, n_valid // 4)
-                longs   = valid[ranked <= q].index.tolist()
-                shorts  = valid[ranked > n_valid - q].index.tolist()
-                positions = pd.Series(0.0, index=tickers)
-                if longs:
-                    positions[longs]  =  1.0 / len(longs)
-                if shorts:
-                    positions[shorts] = -1.0 / len(shorts)
+        if do_rebal:
+            target = _compute_target(px, i, tickers, lookback, skip, use_erc, cov_lookback)
+            target_queue.append(target)
 
-        rebal_counter = (rebal_counter + 1) % rebal_days
+        # Blended position = equal-weight average of all targets in the queue
+        if target_queue:
+            positions = sum(target_queue) / len(target_queue)
+
+        if not monthly:
+            rebal_counter = (rebal_counter + 1) % rebal_days
 
     if not daily_pnl:
         return pd.Series(dtype=float)
 
-    pnl = pd.DataFrame(daily_pnl, columns=["date", "pnl"]).set_index("date")["pnl"]
-    return pnl
+    return pd.DataFrame(daily_pnl, columns=["date", "pnl"]).set_index("date")["pnl"]
 
 
 # ── Statistics ─────────────────────────────────────────────────────────────────
@@ -242,7 +343,14 @@ def main() -> None:
     parser.add_argument("--rebal", type=int, nargs="+", default=[REBAL_DAYS],
                         metavar="N", help="Rebalancing frequency in trading days (can pass multiple)")
     parser.add_argument("--skip", type=int, nargs="+", default=[0],
-                        metavar="N", help="Days to skip at recent end of lookback (0=no skip, 5=1wk, 10=2wk...)")
+                        metavar="N", help="Days to skip at recent end of lookback (0=no skip, 21=1M skip for 12-1 momentum)")
+    parser.add_argument("--slice", type=int, nargs="+", default=[1],
+                        metavar="N", dest="slice_days",
+                        help="Spread each rebal over N days by blending the last N target portfolios (1=no slicing)")
+    parser.add_argument("--erc", action="store_true", default=False,
+                        help="Use Equal Risk Contribution weighting in long and short books")
+    parser.add_argument("--cov-lookback", type=int, default=63,
+                        metavar="N", help="Days of return history used to estimate covariance for ERC")
     parser.add_argument("--plot", action="store_true", default=True,
                         help="Save cumulative return charts")
     parser.add_argument("--no-plot", dest="plot", action="store_false")
@@ -267,21 +375,29 @@ def main() -> None:
     results   = {}   # (universe_label, lookback) -> pnl series
     stats_rows = []
 
-    combos = list(product(sorted(universes.keys()), sorted(args.lookbacks), sorted(args.rebal), sorted(args.skip)))
+    combos = list(product(
+        sorted(universes.keys()),
+        sorted(args.lookbacks),
+        sorted(args.rebal),
+        sorted(args.skip),
+        sorted(args.slice_days),
+    ))
     print(f"\nRunning {len(combos)} backtests ...\n")
 
-    for universe_label, lookback, rebal, skip in combos:
+    for universe_label, lookback, rebal, skip, slice_d in combos:
         tickers = universes[universe_label]
         available = [t for t in tickers if t in close.columns]
         missing   = len(tickers) - len(available)
 
-        pnl = run_backtest(close, available, lookback, rebal, skip)
+        pnl = run_backtest(close, available, lookback, rebal, skip, slice_d,
+                           use_erc=args.erc, cov_lookback=args.cov_lookback)
         results[(universe_label, lookback, skip)] = pnl
         s   = stats(pnl)
 
+        slice_tag = f"  slice={slice_d}d" if slice_d > 1 else ""
         flag = f"  ({missing} missing)" if missing else ""
         print(
-            f"  {universe_label:<25s}  lb={lookback:>3}d  skip={skip:>2}d  rebal={rebal:>2}d  "
+            f"  {universe_label:<25s}  lb={lookback:>3}d  skip={skip:>2}d  rebal={rebal:>2}d{slice_tag}  "
             f"Sharpe={s['sharpe']:>6.2f}  "
             f"AnnRet={s['ann_ret']:>+7.1%}  "
             f"MaxDD={s['max_dd']:>7.1%}  "
@@ -293,6 +409,7 @@ def main() -> None:
             "lookback":   lookback,
             "skip_days":  skip,
             "rebal_days": rebal,
+            "slice_days": slice_d,
             "n_tickers":  len(available),
             **s,
         })
