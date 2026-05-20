@@ -184,7 +184,7 @@ def _erc_book(members: list[str], dr: pd.DataFrame, i: int) -> np.ndarray:
     hist = dr[members].iloc[max(0, i - COV_LB):i].dropna()
     if len(hist) < 10:
         return np.ones(len(members)) / len(members)
-    cov = hist.cov().values
+    cov = hist.cov().values.copy()
     cov += np.eye(len(members)) * np.diag(cov).mean() * 0.10
     return _erc_weights(cov)
 
